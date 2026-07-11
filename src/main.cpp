@@ -28,11 +28,11 @@ using boost::asio::ip::tcp;
 using boost::system::error_code;
 
 constexpr std::string_view delimiter = "\r\n\r\n";
+constexpr size_t kChunkSize = 8192;
 
 struct HttpPack {
     std::string raw;
     std::string_view headers;
-    std::string body;
     size_t need_read;
 };
 
@@ -40,14 +40,21 @@ void split_headers(HttpPack &req) {
     size_t n = req.raw.find(delimiter);
     req.headers = std::string_view(req.raw.data(), n);
     std::string_view already_read = std::string_view(req.raw).substr(n + 4);
-    req.body.assign(already_read.begin(), already_read.end());
 
     auto expected = findContentLength(req.headers);
     size_t content_len = expected.value_or(0);
-    if (req.body.size() < content_len) {
-        req.body.resize(content_len);
+    req.need_read = content_len > already_read.size() ? content_len - already_read.size() : 0;
+}
+
+awaitable<void> resend(size_t need_read, tcp::socket &from, tcp::socket &to) {
+    std::string chunk;
+    while (need_read > 0) {
+        size_t to_read = std::min(need_read, kChunkSize);
+        chunk.clear();
+        co_await boost::asio::async_read(from, dynamic_buffer(chunk, to_read), use_awaitable);
+        co_await boost::asio::async_write(to, buffer(chunk), use_awaitable);
+        need_read -= chunk.size();
     }
-    req.need_read = req.body.size() - already_read.size();
 }
 
 awaitable<void> session(tcp::socket client_socket, io_service &io_service) {
@@ -66,30 +73,14 @@ awaitable<void> session(tcp::socket client_socket, io_service &io_service) {
 
         tcp::socket server_socket(io_service);
         co_await boost::asio::async_connect(server_socket, endpoints, use_awaitable);
-
-        if (req.need_read > 0)
-            co_await boost::asio::async_read(client_socket,
-                                             buffer(req.body.data() + (req.body.size() - req.need_read), req.need_read),
-                                             use_awaitable);
-
-        co_await boost::asio::async_write(server_socket, buffer(req.headers), use_awaitable);
-        co_await boost::asio::async_write(server_socket, buffer(delimiter), use_awaitable);
-        co_await boost::asio::async_write(server_socket, buffer(req.body), use_awaitable);
-
+        co_await boost::asio::async_write(server_socket, buffer(req.raw), use_awaitable);
+        co_await resend(req.need_read, client_socket, server_socket);
         //----------
         HttpPack resp;
         co_await async_read_until(server_socket, dynamic_buffer(resp.raw), delimiter, use_awaitable);
-
         split_headers(resp);
-
-        if (resp.need_read > 0)
-            co_await boost::asio::async_read(
-                server_socket, buffer(resp.body.data() + (resp.body.size() - resp.need_read), resp.need_read),
-                use_awaitable);
-
-        co_await boost::asio::async_write(client_socket, buffer(resp.headers), use_awaitable);
-        co_await boost::asio::async_write(client_socket, buffer(delimiter), use_awaitable);
-        co_await boost::asio::async_write(client_socket, buffer(resp.body), use_awaitable);
+        co_await boost::asio::async_write(client_socket, buffer(resp.raw), use_awaitable);
+        co_await resend(resp.need_read, server_socket, client_socket);
 
     } catch (const std::exception &e) {
         std::println("error: {}", e.what());
